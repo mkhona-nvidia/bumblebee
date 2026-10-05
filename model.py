@@ -1,6 +1,10 @@
-from dataclasses import dataclass
 import math
+from dataclasses import dataclass
+
 import torch
+
+from attention import FlashAttention
+
 
 @dataclass
 class ModelConfig:
@@ -14,6 +18,7 @@ class ModelConfig:
     max_seq_len: int = 512 # We override this elsewhere, based on TrainConfig.seq_len
     vocab_size: int = 1024 # We override this elsewhere, based on TrainConfig.{dataset, tokenizer_model}
     narrow_dtype: torch.dtype = torch.float32 # We override this elsewhere, based on device.type
+    use_flash_attention: bool = False
 
 class GPTModel(torch.nn.Module):
 
@@ -67,10 +72,14 @@ class GPTModel(torch.nn.Module):
         init_normal(self.W_FC1, 0.02)
         init_normal(self.W_FC2, 0.02 * residual_scale)
 
-        tok_idxs = torch.arange(self.max_seq_len)
-        # attn_mask is n_keys-by-n_queries, with True => ignore entry.
-        # For causality, this means an upper triangular False matrix.
-        self.register_buffer('attn_mask', tok_idxs[:, None] > tok_idxs[None, :], persistent=False)
+        self.flash_attention = None
+        if model_config.use_flash_attention:
+            self.flash_attention = FlashAttention(self.num_heads, self.num_query_groups, self.qk_dim, self.v_dim)
+        else:
+            tok_idxs = torch.arange(self.max_seq_len)
+            # attn_mask is n_keys-by-n_queries, with True => ignore entry.
+            # For causality, this means an upper triangular False matrix.
+            self.register_buffer('attn_mask', tok_idxs[:, None] > tok_idxs[None, :], persistent=False)
 
     def forward(self, inputs):
         assert inputs.ndim == 2, "For simplicity, we require inputs is a 2D tensor, shape (B, S)."
@@ -93,11 +102,14 @@ class GPTModel(torch.nn.Module):
             Q = torch.einsum('HdD,BSD->HBSd', self.W_Q[layer, ...].to(nd), Z.to(nd))
             K = torch.einsum('HdD,BSD->HBSd', self.W_K[layer, ...].to(nd), Z.to(nd))
             V = torch.einsum('HdD,BSD->HBSd', self.W_V[layer, ...].to(nd), Z.to(nd))
-            Z = torch.einsum('HBTd,HBSd->HBTS', K.repeat_interleave(self.num_heads // self.num_query_groups, dim=0), Q)
-            Z = Z.div(math.sqrt(self.qk_dim))
-            Z = Z.masked_fill(self.attn_mask[:seq_len, :seq_len], float('-inf'))
-            Z = torch.nn.functional.softmax(Z.to(wd), dim=2)
-            Z = torch.einsum('HBTd,HBTS->HBSd', V.repeat_interleave(self.num_heads // self.num_query_groups, dim=0), Z.to(nd))
+            if self.flash_attention is None:
+                Z = torch.einsum('HBTd,HBSd->HBTS', K.repeat_interleave(self.num_heads // self.num_query_groups, dim=0), Q)
+                Z = Z.div(math.sqrt(self.qk_dim))
+                Z = Z.masked_fill(self.attn_mask[:seq_len, :seq_len], float('-inf'))
+                Z = torch.nn.functional.softmax(Z.to(wd), dim=2)
+                Z = torch.einsum('HBTd,HBTS->HBSd', V.repeat_interleave(self.num_heads // self.num_query_groups, dim=0), Z.to(nd))
+            else:
+                Z = self.flash_attention(Q, K, V, training=self.training)
             Z = torch.einsum('HDd,HBSd->BSD', self.W_O[layer, ...].to(nd), Z)
             X = X + Z.to(wd)
 
