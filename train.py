@@ -1,17 +1,18 @@
+import argparse
 import os
 from dataclasses import dataclass
 
+import tiktoken
 import torch
 import torch.distributed as dist
-
-import tiktoken
-
 from datasets import load_dataset
 from datasets.distributed import split_dataset_by_node
 
-from model import ModelConfig, GPTModel
+from attention import check_flash_attention_device
 from dataloader import dataloader, synthetic_dataloader
+from model import GPTModel, ModelConfig
 from optimizer import OptimConfig, Optimizer
+
 
 @dataclass
 class TrainConfig:
@@ -153,6 +154,10 @@ def run_training(
     else:
         mc.narrow_dtype = torch.float32
 
+    if mc.use_flash_attention:
+        major, minor = check_flash_attention_device(device)
+        print0(f'Flash attention: {torch.cuda.get_device_name(device)} (SM {major}{minor}); Transformer Engine selects the kernel.')
+
     if tc.dataset_name == 'synthetic':
         train_dataloader = synthetic_dataloader(mc.vocab_size, tc.train_local_microbatch_size, tc.seq_len, device, seed=seed + rank)
         valid_dataloader = synthetic_dataloader(mc.vocab_size, tc.valid_local_microbatch_size, tc.seq_len, device, seed=seed + world_size + rank)
@@ -243,8 +248,11 @@ def make_print_helpers(rank):
     return print_n, print_0
 
 def make_configs():
-    # This reference implementation does not actually check environment or command-line. Chat will be happy to add this for you.
-    model_config = ModelConfig()
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--flash-attention', action='store_true', help='Use Transformer Engine fused attention on NVIDIA GPUs.')
+    args = parser.parse_args()
+    # Other settings are still edited directly in the dataclasses above.
+    model_config = ModelConfig(use_flash_attention=args.flash_attention)
     train_config = TrainConfig()
     optim_config = OptimConfig()
 

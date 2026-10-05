@@ -26,9 +26,34 @@ The first time you run `train.py`, it will download and preprocess a very large 
 
 See `interactive-dp8.sh` and `batch-dp32.sh`.
 
+## Optional flash attention
+
+The default keeps the explicit attention math. To use Transformer Engine's
+optimized attention on an Ampere or newer NVIDIA GPU:
+
+```sh
+# In your CUDA environment, if Transformer Engine isn't already installed:
+pip install --no-build-isolation 'transformer_engine[pytorch]>=2.5,<3'
+python train.py --flash-attention
+```
+
+You can also set `ModelConfig(use_flash_attention=True)`. The training script
+reports the selected GPU and SM version; TE chooses FlashAttention or cuDNN's
+flash-based fused attention based on the hardware, dtype and shapes. GQA,
+causality, and the existing attention scale are preserved. The option requires
+FP16/BF16 QKV and raises if no supported optimized kernel is available.
+
+TE is imported only when enabled. Its stateless attention call runs eagerly
+inside `torch.compile`; the rest of the model can still be compiled. Add
+`NVTE_DEBUG=1 NVTE_DEBUG_LEVEL=2` to see TE's backend choice. See TE's
+[installation guide](https://docs.nvidia.com/deeplearning/transformer-engine/installation.html)
+and [attention dispatcher docs](https://docs.nvidia.com/deeplearning/transformer-engine/examples/attention/attention.html).
+
 ## Development
 
-Testing: currently there is no automated testing. I manually test, from time to time, by running `python train.py` and declaring success when the loss looks like it's going down.
+Run `python -m unittest test_attention` for attention parity and configuration
+checks. CPU tests use an SDPA stand-in to check the adapter; the real TE
+forward/backward and compile smoke test requires CUDA and Transformer Engine.
 
 I use a pre-commit Git hook that calls ruff-check. To install this hook on your clone, run the following from the top-level directory:
 
